@@ -25,7 +25,20 @@
 #include <stdint.h>
 #include <stdbool.h>
 
-#define ESB_MAX_PAYLOAD_LENGTH 63
+/* Maximum ESB payload in bytes.
+ *
+ * Above 32 the on-air length field must be widened from 6 to 8 bits, which is
+ * what ESB_LFLEN below derives. A 6 bit peer and an 8 bit peer cannot decode
+ * each other's packets, so the Crazyflie firmware must use the same value.
+ * Keeping this at 32 or below preserves nRF24 (Crazyradio 1.0) compatibility.
+ */
+#define ESB_MAX_PAYLOAD_LENGTH 252
+
+#if ESB_MAX_PAYLOAD_LENGTH > 63
+  #define ESB_LFLEN 8
+#else
+  #define ESB_LFLEN 6
+#endif
 
 typedef enum {
     esbTestModeIdle = 0,

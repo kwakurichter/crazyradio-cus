@@ -193,10 +193,10 @@ void esb_init()
 
     // Low level packet configuration
     nrf_radio_packet_conf_t radioConfig = {0,};
-    radioConfig.lflen = 6;
+    radioConfig.lflen = ESB_LFLEN;
     radioConfig.s0len = 0;
     radioConfig.s1len = 3;
-    radioConfig.maxlen = 32;
+    radioConfig.maxlen = ESB_MAX_PAYLOAD_LENGTH;
     radioConfig.statlen = 0;
     radioConfig.balen = 4;
     radioConfig.big_endian = true;
@@ -629,10 +629,10 @@ static void restore_normal_radio_config_locked(void)
         NRF_RADIO_SHORT_DISABLED_RSSISTOP_MASK);
 
     nrf_radio_packet_conf_t radioConfig = {0,};
-    radioConfig.lflen = 6;
+    radioConfig.lflen = ESB_LFLEN;
     radioConfig.s0len = 0;
     radioConfig.s1len = 3;
-    radioConfig.maxlen = 32;
+    radioConfig.maxlen = ESB_MAX_PAYLOAD_LENGTH;
     radioConfig.statlen = 0;
     radioConfig.balen = 4;
     radioConfig.big_endian = true;
@@ -772,7 +772,7 @@ void esb_sniffer_start(esb_sniffer_rx_cb_t cb)
 
     // Reconfigure radio for max packet length
     nrf_radio_packet_conf_t radioConfig = {0,};
-    radioConfig.lflen = 6;
+    radioConfig.lflen = ESB_LFLEN;
     radioConfig.s0len = 0;
     radioConfig.s1len = 3;
     radioConfig.maxlen = ESB_MAX_PAYLOAD_LENGTH;
@@ -933,12 +933,12 @@ void esb_sniffer_stop(void)
     sniffer_active = false;
     sniffer_callback = NULL;
 
-    // Restore radio to 32-byte max packet length for normal operation
+    // Restore radio to the normal-operation packet length
     nrf_radio_packet_conf_t radioConfig = {0,};
-    radioConfig.lflen = 6;
+    radioConfig.lflen = ESB_LFLEN;
     radioConfig.s0len = 0;
     radioConfig.s1len = 3;
-    radioConfig.maxlen = 32;
+    radioConfig.maxlen = ESB_MAX_PAYLOAD_LENGTH;
     radioConfig.statlen = 0;
     radioConfig.balen = 4;
     radioConfig.big_endian = true;
