@@ -13,7 +13,9 @@
 #include "led.h"
 #include "system.h"
 
-#define USB_ANSWER_MAX_LENGTH 128
+/* Must hold the largest answer: one header byte plus a full ESB ack payload.
+ * Rounded up from 253 for alignment. */
+#define USB_ANSWER_MAX_LENGTH 256
 
 #include <hal/nrf_radio.h>
 
@@ -57,6 +59,14 @@ K_MUTEX_DEFINE(usb_radio_mutex);
 
 static atomic_t sniffer_drop_count;
 
+/* Largest radio payload the USB protocol will carry.
+ *
+ * The legacy Crazyradio protocol is fixed at 32 bytes because the nRF24 it
+ * emulated could not do more. Large packet mode lifts that to the full ESB
+ * payload, and is opt-in so that cfclient and anything else speaking the
+ * legacy protocol keep their existing behaviour byte for byte. */
+static inline uint32_t usb_max_payload(void);
+
 static void fw_scan(uint8_t start, uint8_t stop, char* data, int data_length);
 static void handle_vendor_command(struct setup_command* setup);
 
@@ -70,6 +80,7 @@ static struct {
     bool inline_mode;
     bool inline_rssi_mode;
     bool sniffer_mode;
+    bool large_packet_mode;
     char usb_answer[USB_ANSWER_MAX_LENGTH];
 } state = {
     .datarate = 2,
@@ -78,7 +89,13 @@ static struct {
     .inline_mode = false,
     .inline_rssi_mode = false,
     .sniffer_mode = false,
+    .large_packet_mode = false,
 };
+
+static inline uint32_t usb_max_payload(void)
+{
+    return state.large_packet_mode ? ESB_MAX_PAYLOAD_LENGTH : 32;
+}
 
 // Inline mode out header
 typedef struct {
@@ -116,6 +133,22 @@ typedef struct {
 #define CRAZYRADIO_OUT_EP_ADDR 0x01
 #define CRAZYRADIO_IN_EP_ADDR 0x81
 #define CRAZYRADIO_BULK_EP_MPS 64
+
+/* Write an answer, terminating the transfer properly.
+ *
+ * A bulk transfer whose length is an exact multiple of the endpoint packet
+ * size contains no short packet, so the host cannot tell it has ended and
+ * waits until it times out. A zero length packet terminates it. This never
+ * arose under the legacy protocol because answers were capped at 33 bytes;
+ * with a 252 byte payload, an echo of 63, 127 or 191 bytes hits it. */
+static void usb_write_answer(const void *data, uint32_t length)
+{
+    usb_write(CRAZYRADIO_IN_EP_ADDR, data, length, NULL);
+
+    if (length != 0 && (length % CRAZYRADIO_BULK_EP_MPS) == 0) {
+        usb_write(CRAZYRADIO_IN_EP_ADDR, data, 0, NULL);
+    }
+}
 
 #define INITIALIZER_IF(num_ep, iface_class)				\
 	{								\
@@ -236,6 +269,7 @@ static struct usb_ep_cfg_data ep_cfg[] = {
 #define SET_RADIO_MODE 0x24
 #define SET_SNIFFER_ADDRESS 0x25
 #define GET_SNIFFER_DROP_COUNT 0x26
+#define SET_LARGE_PACKET_MODE 0x27
 #define SET_PACKET_LOSS_SIMULATION 0x30
 #define SET_TEST_MODE          0x31
 #define SET_TEST_NRF_TX_POWER  0x32
@@ -282,6 +316,7 @@ static int crazyradio_vendor_handler(struct usb_setup_packet *setup,
             (setup->bRequest == SET_INLINE_MODE && setup->wValue <= INLINE_MODE_ON_WITH_RSSI) ||
             setup->bRequest == SET_SNIFFER_ADDRESS ||
             (setup->bRequest == SET_RADIO_MODE && setup->wValue <= 1) ||
+            (setup->bRequest == SET_LARGE_PACKET_MODE && setup->wValue <= 1) ||
             setup->bRequest == SET_PACKET_LOSS_SIMULATION ||
             (setup->bRequest == SET_TEST_MODE && usb_reqtype_is_to_device(setup) &&
              setup->wIndex == 0 && setup->wLength == 0 &&
@@ -485,16 +520,19 @@ static void usb_thread(void *, void *, void *) {
                 esb_set_address(header->address);
                 // Prepare the packet data
                 int payload_length = header->length - sizeof(inline_mode_out_header);
-                if (payload_length > 32+8) {
-                    payload_length = 32+8;
+                if (payload_length > (int)usb_max_payload() + 8) {
+                    payload_length = (int)usb_max_payload() + 8;
                 }
                 memcpy(packet.data, &command.data.payload[sizeof(inline_mode_out_header)], payload_length);
                 packet.length = payload_length;
 
                 LOG_ERR("Inline mode packet: chan %d, dr %d, ack %d, addr %02x%02x%02x%02x%02x, len %d", state.channel, state.datarate, state.ack_enabled, header->address[0], header->address[1], header->address[2], header->address[3], header->address[4], payload_length);
-            } else if (state.datarate != 0 && state.channel <= 100 && !state.ack_enabled && command.data.length > 32) {
-                // If we are not receiving ack (ie. broadcast) and the received data is > 32 bytes,
-                // this means that the buffer actually contains 2 packets to send
+            } else if (!state.large_packet_mode && state.datarate != 0 && state.channel <= 100 && !state.ack_enabled && command.data.length > 32) {
+                // Legacy broadcast quirk: outside large packet mode, a >32 byte
+                // transfer with acks off means the buffer holds two packets
+                // back to back rather than one long one. It cannot coexist
+                // with single large packets, which is why large packet mode
+                // has to be opt-in rather than simply raising the cap.
                 // Send the first one right away
                 memcpy(packet.data, command.data.payload, command.data.length/2);
                 packet.length = command.data.length/2;
@@ -504,9 +542,9 @@ static void usb_thread(void *, void *, void *) {
                 memcpy(packet.data, &command.data.payload[command.data.length/2], command.data.length/2);
                 packet.length = command.data.length/2;
             } else {
-                // Otherwise, cap to 32 bytes and prepare the unicast packets
-                if (command.data.length > 32) {
-                    command.data.length = 32;
+                // Otherwise, cap to the protocol maximum and prepare the packet
+                if (command.data.length > usb_max_payload()) {
+                    command.data.length = usb_max_payload();
                 }
                 memcpy(packet.data, command.data.payload, command.data.length);
                 packet.length = command.data.length;
@@ -523,9 +561,9 @@ static void usb_thread(void *, void *, void *) {
                     led_pulse_red(K_MSEC(50));
                 }
 
-                if (ack.length > 32) {
+                if (ack.length > usb_max_payload()) {
                     LOG_ERR("Got an ack of size %d!", ack.length);
-                    ack.length = 32;
+                    ack.length = usb_max_payload();
                 }
 
                 if (state.inline_mode && !state.inline_rssi_mode) {
@@ -543,9 +581,7 @@ static void usb_thread(void *, void *, void *) {
                         memcpy(&state.usb_answer[sizeof(inline_mode_in_header)], ack.data, ack.length);
                     }
 
-                    if (usb_write(CRAZYRADIO_IN_EP_ADDR, state.usb_answer, usb_header->length, NULL)) {
-                        LOG_DBG("ep 0x%x", CRAZYRADIO_IN_EP_ADDR);
-                    }
+                    usb_write_answer(state.usb_answer, usb_header->length);
                 } else if (state.inline_mode && state.inline_rssi_mode) {
                     // Prepare the inline with rssi mode header
                     inline_rssi_mode_in_header *usb_header = (inline_rssi_mode_in_header *)state.usb_answer;
@@ -562,20 +598,16 @@ static void usb_thread(void *, void *, void *) {
                         memcpy(&state.usb_answer[sizeof(inline_rssi_mode_in_header)], ack.data, ack.length);
                     }
 
-                    if (usb_write(CRAZYRADIO_IN_EP_ADDR, state.usb_answer, usb_header->length, NULL)) {
-                        LOG_DBG("ep 0x%x", CRAZYRADIO_IN_EP_ADDR);
-                    }
+                    usb_write_answer(state.usb_answer, usb_header->length);
                 } else {
                     if (!state.ack_enabled) {
                         led_pulse_green(K_MSEC(50));
-                    } else if (acked && ack.length <= 32) {
-                        static char usb_answer[33];
+                    } else if (acked && ack.length <= usb_max_payload()) {
+                        static char usb_answer[USB_ANSWER_MAX_LENGTH];
                         usb_answer[0] = (arc_counter & 0x0f) << 4 | (rssi < 64)<<1 | 1;
                         memcpy(&usb_answer[1], ack.data, ack.length);
                     
-                        if (usb_write(CRAZYRADIO_IN_EP_ADDR, usb_answer, ack.length + 1, NULL)) {
-                            LOG_DBG("ep 0x%x", CRAZYRADIO_IN_EP_ADDR);
-                        }
+                        usb_write_answer(usb_answer, ack.length + 1);
                     } else {
                         char no_ack_answer[1] = {0};
                 
@@ -645,8 +677,8 @@ static void fw_scan(uint8_t start, uint8_t stop, char* data, int data_length) {
     uint8_t rssi;
     uint8_t retry;
 
-    if (data_length > 32) {
-        data_length = 32;
+    if (data_length > (int)usb_max_payload()) {
+        data_length = (int)usb_max_payload();
     }
 
     memcpy(packet.data, data, data_length);
@@ -717,6 +749,10 @@ static void handle_vendor_command(struct setup_command* setup) {
         esb_set_continuous_carrier(enable);
     } else if (setup->setup_packet.bRequest == SET_MODE && setup->setup_packet.wLength == 0) {
         LOG_DBG("Setting radio Mode %d", setup->setup_packet.wValue);
+    } else if (setup->setup_packet.bRequest == SET_LARGE_PACKET_MODE && setup->setup_packet.wLength == 0) {
+        bool enabled = setup->setup_packet.wValue != 0;
+        LOG_DBG("Setting large packet mode %s", enabled?"true":"false");
+        state.large_packet_mode = enabled;
     } else if (setup->setup_packet.bRequest == SET_RADIO_MODE && setup->setup_packet.wLength == 0) {
         LOG_DBG("Setting radio mode %d", setup->setup_packet.wValue);
         if (setup->setup_packet.wValue == 1) {
