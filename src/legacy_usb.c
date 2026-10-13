@@ -1,3 +1,4 @@
+#include <errno.h>
 #include <autoconf.h>
 
 #include <zephyr/kernel.h>
@@ -134,20 +135,19 @@ typedef struct {
 #define CRAZYRADIO_IN_EP_ADDR 0x81
 #define CRAZYRADIO_BULK_EP_MPS 64
 
-/* Write an answer, terminating the transfer properly.
- *
- * A bulk transfer whose length is an exact multiple of the endpoint packet
- * size contains no short packet, so the host cannot tell it has ended and
- * waits until it times out. A zero length packet terminates it. This never
- * arose under the legacy protocol because answers were capped at 33 bytes;
- * with a 252 byte payload, an echo of 63, 127 or 191 bytes hits it. */
-static void usb_write_answer(const void *data, uint32_t length)
+/* Wait for the IN transfer to finish before reusing its buffer. The Zephyr
+ * transfer API sends a required ZLP after completion of the data transfer.
+ * Back-to-back usb_write() calls can reject the ZLP with -EAGAIN while DMA is
+ * still active, leaving a host read of a 64-byte multiple waiting forever. */
+static int usb_write_answer(const void *data, uint32_t length)
 {
-    usb_write(CRAZYRADIO_IN_EP_ADDR, data, length, NULL);
-
-    if (length != 0 && (length % CRAZYRADIO_BULK_EP_MPS) == 0) {
-        usb_write(CRAZYRADIO_IN_EP_ADDR, data, 0, NULL);
+    int transferred = usb_transfer_sync(CRAZYRADIO_IN_EP_ADDR,
+                                       (uint8_t *)data, length, USB_TRANS_WRITE);
+    if (transferred < 0 || (uint32_t)transferred != length) {
+        LOG_ERR("USB answer incomplete: %d of %u", transferred, length);
+        return transferred < 0 ? transferred : -EIO;
     }
+    return 0;
 }
 
 #define INITIALIZER_IF(num_ep, iface_class)				\
@@ -240,7 +240,7 @@ void crazyradio_out_cb(uint8_t ep, enum usb_dc_ep_cb_status_code cb_status)
 
 void crazyradio_in_cb(uint8_t ep, enum usb_dc_ep_cb_status_code cb_status)
 {
-	// Nop
+    usb_transfer_ep_callback(ep, cb_status);
 }
 
 static struct usb_ep_cfg_data ep_cfg[] = {
@@ -465,10 +465,7 @@ static void usb_thread(void *, void *, void *) {
                     memcpy(&state.usb_answer[7], sniffer_pkt.data, sniffer_pkt.length);
                 }
 
-                usb_write(CRAZYRADIO_IN_EP_ADDR, state.usb_answer, total_length, NULL);
-                if (total_length == CRAZYRADIO_BULK_EP_MPS) {
-                    usb_write(CRAZYRADIO_IN_EP_ADDR, state.usb_answer, 0, NULL);
-                }
+                usb_write_answer(state.usb_answer, total_length);
                 led_pulse_green(K_MSEC(50));
             }
             continue;
@@ -486,8 +483,7 @@ static void usb_thread(void *, void *, void *) {
                     .invalid_settings = 0,
                     .arc_counter = 0,
                 };
-                usb_write(CRAZYRADIO_IN_EP_ADDR, (void *)&test_mode_header,
-                          test_mode_header.length, NULL);
+                usb_write_answer((void *)&test_mode_header, test_mode_header.length);
             } else if (state.inline_mode && state.inline_rssi_mode) {
                 inline_rssi_mode_in_header test_mode_header = {
                     .length = sizeof(inline_rssi_mode_in_header),
@@ -497,11 +493,10 @@ static void usb_thread(void *, void *, void *) {
                     .arc_counter = 0,
                     .rssi_dbm = 0,
                 };
-                usb_write(CRAZYRADIO_IN_EP_ADDR, (void *)&test_mode_header,
-                          test_mode_header.length, NULL);
+                usb_write_answer((void *)&test_mode_header, test_mode_header.length);
             } else if (state.ack_enabled) {
                 char no_ack_answer[1] = {0};
-                usb_write(CRAZYRADIO_IN_EP_ADDR, no_ack_answer, 1, NULL);
+                usb_write_answer(no_ack_answer, 1);
             }
             k_mutex_unlock(&usb_radio_mutex);
             continue;
@@ -611,7 +606,7 @@ static void usb_thread(void *, void *, void *) {
                     } else {
                         char no_ack_answer[1] = {0};
                 
-                        if (usb_write(CRAZYRADIO_IN_EP_ADDR, no_ack_answer, 1, NULL)) {
+                        if (usb_write_answer(no_ack_answer, 1)) {
                             LOG_DBG("ep 0x%x", CRAZYRADIO_IN_EP_ADDR);
                         }
                     }
@@ -630,7 +625,7 @@ static void usb_thread(void *, void *, void *) {
                         .arc_counter = 0,
                     };
 
-                    if (usb_write(CRAZYRADIO_IN_EP_ADDR, (void*) &invalid_settings_header, invalid_settings_header.length, NULL)) {
+                    if (usb_write_answer((void*) &invalid_settings_header, invalid_settings_header.length)) {
                         LOG_DBG("ep 0x%x", CRAZYRADIO_IN_EP_ADDR);
                     }
                 } else if (state.inline_mode && state.inline_rssi_mode) {
@@ -644,13 +639,13 @@ static void usb_thread(void *, void *, void *) {
                         .rssi_dbm = 0,
                     };
 
-                    if (usb_write(CRAZYRADIO_IN_EP_ADDR, (void*) &invalid_settings_header, invalid_settings_header.length, NULL)) {
+                    if (usb_write_answer((void*) &invalid_settings_header, invalid_settings_header.length)) {
                         LOG_DBG("ep 0x%x", CRAZYRADIO_IN_EP_ADDR);
                     }
                 } else {
                     char no_ack_answer[1] = {0};
             
-                    if (usb_write(CRAZYRADIO_IN_EP_ADDR, no_ack_answer, 1, NULL)) {
+                    if (usb_write_answer(no_ack_answer, 1)) {
                         LOG_DBG("ep 0x%x", CRAZYRADIO_IN_EP_ADDR);
                     }
                 }
